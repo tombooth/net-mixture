@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 
@@ -18,56 +19,64 @@ const source string = `
 #include <bcc/proto.h>
 
 typedef struct {
-	u32 pid;
+	u64 pid;
     u32 saddr;
     u32 daddr;
-    u64 dport;
+    u16 dport;
+    u16 __padding1;
+    u32 __padding2;
 } connect_event_t;
 
 BPF_PERF_OUTPUT(connect_events);
-BPF_HASH(connectcall, u32, connect_event_t);
+BPF_HASH(connectcall, u64, struct sock *);
 
 int kprobe__tcp_v4_connect(struct pt_regs *ctx, struct sock *sk)
 {
-	u32 pid = bpf_get_current_pid_tgid();
-    connect_event_t event = {
-		.pid = pid,
-        .saddr = sk->__sk_common.skc_rcv_saddr,
-        .daddr = sk->__sk_common.skc_daddr,
-        .dport = sk->__sk_common.skc_dport
-	};
-	// stash the sock ptr for lookup on return
-	connectcall.update(&pid, &event);
+	u64 pid = bpf_get_current_pid_tgid();
+	connectcall.update(&pid, &sk);
 	return 0;
 };
 
 int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 {
 	int ret = PT_REGS_RC(ctx);
-	u32 pid = bpf_get_current_pid_tgid();
-	connect_event_t *eventp = connectcall.lookup(&pid);
-	if (eventp == 0) {
+	u64 pid = bpf_get_current_pid_tgid();
+	struct sock **skp = connectcall.lookup(&pid);
+	if (skp == 0) {
 		return 0;	// missed entry
 	}
 	if (ret != 0) {
-		// failed to send SYNC packet, may not have populated
-		// socket __sk_common.{skc_rcv_saddr, ...}
 		connectcall.delete(&pid);
 		return 0;
 	}
+        struct sock *sk = *skp;
+        u16 dport = sk->__sk_common.skc_dport;
 	// pull in details
-    connect_event_t event = *eventp;
+  	  connect_event_t event = {
+		.pid = pid,
+		.saddr = sk->__sk_common.skc_rcv_saddr,
+       	 	.daddr = sk->__sk_common.skc_daddr,
+        	.dport = ntohs(dport)
+	};
     // output
     connect_events.perf_submit(ctx, &event, sizeof(event));
     connectcall.delete(&pid);
 	return 0;
 }
 `
+
 type connectEvent struct {
-	Pid         uint32
-	Saddr       uint32
-	Daddr       uint32
-	Dport       uint64
+	Pid   uint32
+	Tgid  uint32
+	Saddr uint32
+	Daddr uint32
+	Dport uint16
+}
+
+func int2ip(nn uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.LittleEndian.PutUint32(ip, nn)
+	return ip
 }
 
 func main() {
@@ -80,7 +89,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	syscallName := bcc.GetSyscallFnName("connect")
+	syscallName := "tcp_v4_connect"
 
 	err = m.AttachKprobe(syscallName, connectKprobe)
 	if err != nil {
@@ -117,13 +126,14 @@ func main() {
 		var event connectEvent
 		for {
 			data := <-channel
-			err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &event)
+			buf := bytes.NewBuffer(data)
+			err := binary.Read(buf, binary.LittleEndian, &event)
 			if err != nil {
 				fmt.Printf("failed to decode received data: %s\n", err)
 				continue
 			}
-			fmt.Printf("pid %d called tcp_v4_connect(2) on %d %d %d\n",
-				event.Pid, event.Saddr, event.Daddr, event.Dport)
+			fmt.Printf("pid %d called tcp_v4_connect(2) on %s %s %d\n",
+				event.Pid, int2ip(event.Saddr), int2ip(event.Daddr), event.Dport)
 		}
 	}()
 
